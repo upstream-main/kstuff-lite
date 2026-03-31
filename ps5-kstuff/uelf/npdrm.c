@@ -187,14 +187,14 @@ int try_handle_npdrm_mailbox(uint64_t *regs, uint64_t lr)
 #else
     if (lr == (uint64_t)sceSblServiceMailbox_lr_npdrm_cmd_6)
 #endif
-    {
-        uint8_t decrypted_secret[sizeof(layout.rif.rifSecret)];
-        if (aes_cbc_128_decrypt_rif_debug_fpu_held(decrypted_secret, layout.rif.rifSecret,
-                                                   sizeof(layout.rif.rifSecret), layout.rif.rifIv))
         {
-            uelf_fpu_exit();
-            return 1;
-        }
+            uint8_t decrypted_secret[sizeof(layout.rif.rifSecret)];
+            if (aes_cbc_128_decrypt_rif_debug_fpu_held(decrypted_secret, layout.rif.rifSecret,
+                                                       sizeof(layout.rif.rifSecret), layout.rif.rifIv))
+            {
+                uelf_fpu_exit();
+                return 1;
+            }
 
         if (memcmp(contentid_hash + 16, decrypted_secret, 16) != 0)
         {
@@ -204,8 +204,7 @@ int try_handle_npdrm_mailbox(uint64_t *regs, uint64_t lr)
         }
 
         // copy both unk10 and unk20
-        if (copy_to_kernel(regs[RDX] + __builtin_offsetof(struct NpDrmCmd6, unk10),
-                           &decrypted_secret[0x70], 0x20))
+        if(copy_to_kernel(regs[RDX] + __builtin_offsetof(struct NpDrmCmd6, unk10), &decrypted_secret[0x70], 0x20))
         {
             uelf_fpu_exit();
             return 1;

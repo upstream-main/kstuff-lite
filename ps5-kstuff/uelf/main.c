@@ -224,42 +224,75 @@ from_userspace:
 #endif
     else
     {
-        int decrypted = 0;
-        uint32_t decrypt_mask = 0;
-#define DECRYPT(which, bit, field) if((regs[which] >> 48) == 0xdeb7) { regs[which] |= 0xffffull << 48; decrypted = 1; decrypt_mask |= (1u << (bit)); METRIC_INC(debug_reg_decrypt_events); METRIC_INC(field); }
-        DECRYPT(RAX, 0, debug_reg_decrypt_rax)
-        DECRYPT(RCX, 1, debug_reg_decrypt_rcx)
-        DECRYPT(RDX, 2, debug_reg_decrypt_rdx)
-        DECRYPT(RBX, 3, debug_reg_decrypt_rbx)
-        //DECRYPT(RSP, 4)
-        DECRYPT(RBP, 5, debug_reg_decrypt_rbp)
-        DECRYPT(RSI, 6, debug_reg_decrypt_rsi)
-        DECRYPT(RDI, 7, debug_reg_decrypt_rdi)
-        DECRYPT(R8, 8, debug_reg_decrypt_r8)
-        DECRYPT(R9, 9, debug_reg_decrypt_r9)
-        DECRYPT(R10, 10, debug_reg_decrypt_r10)
-        DECRYPT(R11, 11, debug_reg_decrypt_r11)
-        DECRYPT(R12, 12, debug_reg_decrypt_r12)
-        DECRYPT(R13, 13, debug_reg_decrypt_r13)
-        DECRYPT(R14, 14, debug_reg_decrypt_r14)
-        DECRYPT(R15, 15, debug_reg_decrypt_r15)
-#undef DECRYPT
-        if(!decrypted)
+        const uint64_t poisoned_hi = 0xdeb7;
+        const uint64_t restore_hi = 0xffffull << 48;
+#define IS_POISONED(which) ((regs[which] >> 48) == poisoned_hi)
+#define FIX_POISONED(which, field) do { regs[which] |= restore_hi; METRIC_INC(debug_reg_decrypt_events); METRIC_INC(field); } while(0)
+        if(__builtin_expect(IS_POISONED(RSI), 1))
         {
-            //probably a debug trap that's not yet handled
-            METRIC_INC(debug_unhandled_traps);
-            log_msg("uelf: unhandled debug trap\n");
-            log_word(regs[RIP]);
-            log_word(16);
-        }
-        else if(decrypt_mask == (1u << 6))
-            METRIC_INC(debug_reg_decrypt_rsi_only_events);
-        else if(decrypt_mask & (1u << 6))
+            int other_poisoned =
+                IS_POISONED(RAX) | IS_POISONED(RCX) | IS_POISONED(RDX) | IS_POISONED(RBX) |
+                IS_POISONED(RBP) | IS_POISONED(RDI) | IS_POISONED(R8)  | IS_POISONED(R9)  |
+                IS_POISONED(R10) | IS_POISONED(R11) | IS_POISONED(R12) | IS_POISONED(R13) |
+                IS_POISONED(R14) | IS_POISONED(R15);
+            FIX_POISONED(RSI, debug_reg_decrypt_rsi);
+            if(__builtin_expect(!other_poisoned, 1))
+            {
+                METRIC_INC(debug_reg_decrypt_rsi_only_events);
+                return;
+            }
             METRIC_INC(debug_reg_decrypt_rsi_multi_events);
-        else if(!(decrypt_mask & (decrypt_mask - 1)))
-            METRIC_INC(debug_reg_decrypt_non_rsi_single_events);
+            if(IS_POISONED(RAX)) FIX_POISONED(RAX, debug_reg_decrypt_rax);
+            if(IS_POISONED(RCX)) FIX_POISONED(RCX, debug_reg_decrypt_rcx);
+            if(IS_POISONED(RDX)) FIX_POISONED(RDX, debug_reg_decrypt_rdx);
+            if(IS_POISONED(RBX)) FIX_POISONED(RBX, debug_reg_decrypt_rbx);
+            if(IS_POISONED(RBP)) FIX_POISONED(RBP, debug_reg_decrypt_rbp);
+            if(IS_POISONED(RDI)) FIX_POISONED(RDI, debug_reg_decrypt_rdi);
+            if(IS_POISONED(R8)) FIX_POISONED(R8, debug_reg_decrypt_r8);
+            if(IS_POISONED(R9)) FIX_POISONED(R9, debug_reg_decrypt_r9);
+            if(IS_POISONED(R10)) FIX_POISONED(R10, debug_reg_decrypt_r10);
+            if(IS_POISONED(R11)) FIX_POISONED(R11, debug_reg_decrypt_r11);
+            if(IS_POISONED(R12)) FIX_POISONED(R12, debug_reg_decrypt_r12);
+            if(IS_POISONED(R13)) FIX_POISONED(R13, debug_reg_decrypt_r13);
+            if(IS_POISONED(R14)) FIX_POISONED(R14, debug_reg_decrypt_r14);
+            if(IS_POISONED(R15)) FIX_POISONED(R15, debug_reg_decrypt_r15);
+            return;
+        }
         else
-            METRIC_INC(debug_reg_decrypt_non_rsi_multi_events);
+        {
+            int fixed = 0;
+#define FIX_NON_RSI(which, field) if(IS_POISONED(which)) { FIX_POISONED(which, field); fixed++; }
+            FIX_NON_RSI(RAX, debug_reg_decrypt_rax);
+            FIX_NON_RSI(RCX, debug_reg_decrypt_rcx);
+            FIX_NON_RSI(RDX, debug_reg_decrypt_rdx);
+            FIX_NON_RSI(RBX, debug_reg_decrypt_rbx);
+            FIX_NON_RSI(RBP, debug_reg_decrypt_rbp);
+            FIX_NON_RSI(RDI, debug_reg_decrypt_rdi);
+            FIX_NON_RSI(R8, debug_reg_decrypt_r8);
+            FIX_NON_RSI(R9, debug_reg_decrypt_r9);
+            FIX_NON_RSI(R10, debug_reg_decrypt_r10);
+            FIX_NON_RSI(R11, debug_reg_decrypt_r11);
+            FIX_NON_RSI(R12, debug_reg_decrypt_r12);
+            FIX_NON_RSI(R13, debug_reg_decrypt_r13);
+            FIX_NON_RSI(R14, debug_reg_decrypt_r14);
+            FIX_NON_RSI(R15, debug_reg_decrypt_r15);
+#undef FIX_NON_RSI
+            if(fixed)
+            {
+                if(fixed == 1)
+                    METRIC_INC(debug_reg_decrypt_non_rsi_single_events);
+                else
+                    METRIC_INC(debug_reg_decrypt_non_rsi_multi_events);
+                return;
+            }
+        }
+#undef FIX_POISONED
+#undef IS_POISONED
+        //probably a debug trap that's not yet handled
+        METRIC_INC(debug_unhandled_traps);
+        log_msg("uelf: unhandled debug trap\n");
+        log_word(regs[RIP]);
+        log_word(16);
     }
 }
 

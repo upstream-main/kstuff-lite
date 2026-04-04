@@ -41,17 +41,21 @@ extern char mprotect_fix_start[];
 
 void handle_syscall(uint64_t* regs, int allow_kekcall)
 {
+    METRIC_TIME_START(start_cycles);
     const uint64_t sysent = regs[RAX];
+    observe_syscall_armed(KSTUFF_SYSCALL_NONE);
+#define RETURN_HANDLE_SYSCALL() do { METRIC_TIME(handle_syscall_cycles_total, handle_syscall_cycles_max, start_cycles); return; } while(0)
 #define IS_PPR(which) (sysent == (uint64_t)&sysents[SYS_##which])
 #ifdef FREEBSD
 #define IS_PS4(which) 0
 #else
-#define IS_PS4(which) (sysent == (uint64_t)&sysents_ps4[SYS_##which])
+    #define IS_PS4(which) (sysent == (uint64_t)&sysents_ps4[SYS_##which])
     if(IS_PPR(ioctl) || IS_PS4(ioctl))
     {
         METRIC_INC(syscall_ioctl_dispatches);
+        observe_syscall_armed(KSTUFF_SYSCALL_IOCTL);
         handle_ioctl_syscall(regs);
-        return;
+        RETURN_HANDLE_SYSCALL();
     }
 #endif
 #define IS(which) (IS_PPR(which) || IS_PS4(which))
@@ -64,7 +68,7 @@ void handle_syscall(uint64_t* regs, int allow_kekcall)
         const uint64_t syscall_extra = (FWVER >= 0x1000 ? 0x10 : 0);
         uint64_t args_offset = syscall_rsp_to_regs_stash + syscall_extra + 8;
         if(copy_from_kernel(syscall_frame, regs[RSP], args_offset + sizeof(args)))
-            return;
+            RETURN_HANDLE_SYSCALL();
         memcpy(args, syscall_frame + args_offset, sizeof(args));
         int err = handle_kekcall(regs, args, args[RAX]>>32);
         if(err != ENOSYS)
@@ -76,50 +80,98 @@ void handle_syscall(uint64_t* regs, int allow_kekcall)
             regs[RSP] += 8;
             regs[RIP] = syscall_lr;
         }
-        return;
+        RETURN_HANDLE_SYSCALL();
     }
 #ifndef FREEBSD
     if(IS(mprotect)
          || IS_PPR(mdbg_call))
     {
         METRIC_INC(syscall_fix_dispatches);
+        observe_syscall_armed(IS(mprotect) ? KSTUFF_SYSCALL_MPROTECT : KSTUFF_SYSCALL_MDBG_CALL);
         handle_syscall_fix(regs);
-        return;
+        RETURN_HANDLE_SYSCALL();
     }
-    if(IS(nmount)
-         || IS(unmount))
+    if(IS(nmount))
     {
         METRIC_INC(syscall_fpkg_dispatches);
+        observe_syscall_armed(KSTUFF_SYSCALL_NMOUNT);
         handle_fpkg_syscall(regs);
-        return;
+        RETURN_HANDLE_SYSCALL();
     }
-    if(IS(execve)
-         || IS(dynlib_load_prx)
-         || IS(get_self_auth_info)
-         || IS(get_sdk_compiled_version)
-         || IS_PPR(get_ppr_sdk_compiled_version)
-#ifdef FIRMWARE_PORTING
-         || IS_PPR(mmap)
-         || IS_PPR(mlock)
-#endif
-    )
+    if(IS(unmount))
+    {
+        METRIC_INC(syscall_fpkg_dispatches);
+        observe_syscall_armed(KSTUFF_SYSCALL_UNMOUNT);
+        handle_fpkg_syscall(regs);
+        RETURN_HANDLE_SYSCALL();
+    }
+    if(IS(execve))
     {
         METRIC_INC(syscall_fself_dispatches);
+        observe_syscall_armed(KSTUFF_SYSCALL_EXECVE);
         handle_fself_syscall(regs);
-        return;
+        RETURN_HANDLE_SYSCALL();
     }
+    if(IS(dynlib_load_prx))
+    {
+        METRIC_INC(syscall_fself_dispatches);
+        observe_syscall_armed(KSTUFF_SYSCALL_DYNLIB_LOAD_PRX);
+        handle_fself_syscall(regs);
+        RETURN_HANDLE_SYSCALL();
+    }
+    if(IS(get_self_auth_info))
+    {
+        METRIC_INC(syscall_fself_dispatches);
+        observe_syscall_armed(KSTUFF_SYSCALL_GET_SELF_AUTH_INFO);
+        handle_fself_syscall(regs);
+        RETURN_HANDLE_SYSCALL();
+    }
+    if(IS(get_sdk_compiled_version))
+    {
+        METRIC_INC(syscall_fself_dispatches);
+        observe_syscall_armed(KSTUFF_SYSCALL_GET_SDK_COMPILED_VERSION);
+        handle_fself_syscall(regs);
+        RETURN_HANDLE_SYSCALL();
+    }
+    if(IS_PPR(get_ppr_sdk_compiled_version))
+    {
+        METRIC_INC(syscall_fself_dispatches);
+        observe_syscall_armed(KSTUFF_SYSCALL_GET_PPR_SDK_COMPILED_VERSION);
+        handle_fself_syscall(regs);
+        RETURN_HANDLE_SYSCALL();
+    }
+#ifdef FIRMWARE_PORTING
+    if(IS_PPR(mmap))
+    {
+        METRIC_INC(syscall_fself_dispatches);
+        observe_syscall_armed(KSTUFF_SYSCALL_MMAP);
+        handle_fself_syscall(regs);
+        RETURN_HANDLE_SYSCALL();
+    }
+    if(IS_PPR(mlock))
+    {
+        METRIC_INC(syscall_fself_dispatches);
+        observe_syscall_armed(KSTUFF_SYSCALL_MLOCK);
+        handle_fself_syscall(regs);
+        RETURN_HANDLE_SYSCALL();
+    }
+#endif
 #endif
 #undef IS
 #undef IS_PS4
 #undef IS_PPR
+#undef RETURN_HANDLE_SYSCALL
+    METRIC_TIME(handle_syscall_cycles_total, handle_syscall_cycles_max, start_cycles);
 }
 
 static inline int handle_generic_decrypt_trap(uint64_t* regs)
 {
+    METRIC_TIME_START(start_cycles);
     const uint64_t poisoned_hi = 0xdeb7;
     const uint64_t restore_hi = 0xffffull << 48;
 #define IS_POISONED(which) ((regs[which] >> 48) == poisoned_hi)
 #define FIX_POISONED(which, field) do { regs[which] |= restore_hi; METRIC_INC(debug_reg_decrypt_events); METRIC_INC(field); } while(0)
+#define RETURN_GENERIC_DECRYPT(value) do { METRIC_TIME(generic_decrypt_cycles_total, generic_decrypt_cycles_max, start_cycles); return (value); } while(0)
     /*
      * Telemetry shows that almost every generic decrypt fixup is RSI-only.
      * The only other registers that show up with non-trivial frequency are
@@ -141,7 +193,7 @@ static inline int handle_generic_decrypt_trap(uint64_t* regs)
             if(__builtin_expect(!cold_other_poisoned, 1))
             {
                 METRIC_INC(debug_reg_decrypt_rsi_only_events);
-                return 1;
+                RETURN_GENERIC_DECRYPT(1);
             }
             METRIC_INC(debug_reg_decrypt_rsi_multi_events);
             if(IS_POISONED(RCX)) FIX_POISONED(RCX, debug_reg_decrypt_rcx);
@@ -154,7 +206,7 @@ static inline int handle_generic_decrypt_trap(uint64_t* regs)
             if(IS_POISONED(R13)) FIX_POISONED(R13, debug_reg_decrypt_r13);
             if(IS_POISONED(R14)) FIX_POISONED(R14, debug_reg_decrypt_r14);
             if(IS_POISONED(R15)) FIX_POISONED(R15, debug_reg_decrypt_r15);
-            return 1;
+            RETURN_GENERIC_DECRYPT(1);
         }
         METRIC_INC(debug_reg_decrypt_rsi_multi_events);
         if(IS_POISONED(RAX)) FIX_POISONED(RAX, debug_reg_decrypt_rax);
@@ -178,7 +230,7 @@ static inline int handle_generic_decrypt_trap(uint64_t* regs)
             if(IS_POISONED(R14)) FIX_POISONED(R14, debug_reg_decrypt_r14);
             if(IS_POISONED(R15)) FIX_POISONED(R15, debug_reg_decrypt_r15);
         }
-        return 1;
+        RETURN_GENERIC_DECRYPT(1);
     }
     else
     {
@@ -211,7 +263,7 @@ static inline int handle_generic_decrypt_trap(uint64_t* regs)
                 METRIC_INC(debug_reg_decrypt_non_rsi_single_events);
             else
                 METRIC_INC(debug_reg_decrypt_non_rsi_multi_events);
-            return 1;
+            RETURN_GENERIC_DECRYPT(1);
         }
     }
 #undef FIX_POISONED
@@ -220,7 +272,7 @@ static inline int handle_generic_decrypt_trap(uint64_t* regs)
     log_msg("uelf: unhandled debug trap\n");
     log_word(regs[RIP]);
     log_word(16);
-    return 1;
+    RETURN_GENERIC_DECRYPT(1);
 }
 
 #ifndef FREEBSD
@@ -242,6 +294,7 @@ static inline int handle_kernel_trap_fast(uint64_t* regs, uint64_t rip)
         if(try_handle_fpkg_trap(regs))
         {
             METRIC_INC(fpkg_traps);
+            observe_current_syscall_trap();
             return 1;
         }
     }
@@ -250,6 +303,8 @@ static inline int handle_kernel_trap_fast(uint64_t* regs, uint64_t rip)
         if(try_handle_fself_trap(regs))
         {
             METRIC_INC(fself_traps);
+            observe_current_syscall_trap();
+            observe_current_syscall_emulated();
             return 1;
         }
     }
@@ -258,6 +313,8 @@ static inline int handle_kernel_trap_fast(uint64_t* regs, uint64_t rip)
         if(try_handle_syscall_fix_trap(regs))
         {
             METRIC_INC(syscall_fix_traps);
+            observe_current_syscall_trap();
+            observe_current_syscall_emulated();
             return 1;
         }
     }
@@ -267,6 +324,8 @@ static inline int handle_kernel_trap_fast(uint64_t* regs, uint64_t rip)
 
 void handle(uint64_t* regs)
 {
+    METRIC_TIME_START(start_cycles);
+#define RETURN_HANDLE() do { METRIC_TIME(handle_cycles_total, handle_cycles_max, start_cycles); return; } while(0)
     METRIC_INC(handle_entries);
     const int initial_from_user = !!(regs[CS] & 3);
     const int initial_from_copyio = !!(regs[EFLAGS] & 0x40000);
@@ -283,7 +342,7 @@ void handle(uint64_t* regs)
 #else
         handle_generic_decrypt_trap(regs);
 #endif
-        return;
+        RETURN_HANDLE();
     }
     if(initial_from_user || initial_from_copyio) //from userspace, or from copyin/copyout
     {
@@ -295,14 +354,14 @@ from_userspace:
             //determine correct gsbase for userspace
             uint64_t pcb;
             uint64_t gsbase;
-            if(get_current_pcb_checked(&pcb))
-                return;
+                if(get_current_pcb_checked(&pcb))
+                RETURN_HANDLE();
             if(copy_from_kernel(&gsbase, get_pcb_field_ptr(pcb, pcb_gsbase), sizeof(gsbase)))
-                return;
+                RETURN_HANDLE();
             //arm wrmsr in the exit path
             uint64_t args[3] = {gsbase >> 32, 0xc0000101, (uint32_t)gsbase};
             if(copy_to_kernel(wrmsr_args, args, sizeof(args)))
-                return;
+                RETURN_HANDLE();
         }
         //inject a fake #DB or #GP exception
         uint64_t stack;
@@ -315,7 +374,7 @@ from_userspace:
             if(from_user)
             {
                 if(copy_from_kernel(&stack, (uint64_t)tss+4, 8))
-                    return;
+                    RETURN_HANDLE();
             }
             else
                 stack = regs[RSP];
@@ -325,14 +384,14 @@ from_userspace:
         {
             stack -= 48;
             if(copy_to_kernel(stack, &regs[ERRC], 48))
-                return;
+                RETURN_HANDLE();
             regs[RIP] = (uint64_t)int13_handler;
         }
         else
         {
             stack -= 40;
             if(copy_to_kernel(stack, &regs[RIP], 40))
-                return;
+                RETURN_HANDLE();
             regs[RIP] = (uint64_t)int1_handler;
         }
         regs[CS] = 0x20;
@@ -348,9 +407,9 @@ from_userspace:
         regs[RAX] |= 0xffffull << 48;
         regs[RSI] = regs[RSP] + syscall_rsp_to_rsi + syscall_extra;
         if(copy_from_kernel(&syscall_target, regs[RAX]+8, sizeof(syscall_target)))
-            return;
+            RETURN_HANDLE();
         if(push_stack_checked(regs, (const uint64_t[1]){(uint64_t)syscall_after}, 8))
-            return;
+            RETURN_HANDLE();
         regs[RIP] = syscall_target;
         handle_syscall(regs, 1);
     }
@@ -359,13 +418,13 @@ from_userspace:
         METRIC_INC(handle_doreti_iret_entries);
         uint64_t frame[5];
         if(copy_from_kernel(frame, regs[RSP], 16))
-            return;
+            RETURN_HANDLE();
         if((frame[1] & 3)) //#GP in iret to userspace
         {
             //pretend that the #GP was inside userspace
             //stock kernel crashes on this, lol
             if(copy_from_kernel(frame + 2, regs[RSP] + 16, sizeof(frame) - 16))
-                return;
+                RETURN_HANDLE();
             memcpy(&regs[RIP], frame, sizeof(frame));
             goto from_userspace;
         }
@@ -380,6 +439,8 @@ from_userspace:
 #endif
         }
     }
+#undef RETURN_HANDLE
+    METRIC_TIME(handle_cycles_total, handle_cycles_max, start_cycles);
 }
 
 void main(uint64_t just_return)

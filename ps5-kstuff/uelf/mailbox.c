@@ -17,16 +17,20 @@ int try_handle_mailbox_trap(uint64_t* regs)
         if(try_handle_fself_mailbox(regs, lr))
         {
             METRIC_INC(mailbox_fself);
+            observe_current_syscall_trap();
+            observe_current_syscall_emulated();
             return 1;
         }
         if(try_handle_fpkg_mailbox(regs, lr))
         {
             METRIC_INC(mailbox_fpkg);
+            observe_current_syscall_trap();
             return 1;
         }
         if(try_handle_npdrm_mailbox(regs, lr))
         {
             METRIC_INC(mailbox_npdrm);
+            observe_current_syscall_trap();
             return 1;
         }
         METRIC_INC(mailbox_unhandled);

@@ -100,11 +100,17 @@ static int parse_header_fself(uint64_t header, uint32_t size, struct fself_heade
     uint16_t n_entries;
     memset(info, 0, sizeof(*info));
     if(copy_from_kernel_buffer(&n_entries, header, header_end, 24, sizeof(n_entries)))
+    {
+        METRIC_INC(fself_header_parse_failures);
         return 0;
+    }
     uint64_t elf_offset = 32 + 32 * n_entries;
     uint64_t elf[8];
     if(copy_from_kernel_buffer(elf, header, header_end, elf_offset, sizeof(elf)))
+    {
+        METRIC_INC(fself_header_parse_failures);
         return 0;
+    }
     info->e_type = elf[2];
     info->is_ps4 = (uint8_t)elf[1] < 2;
     uint64_t e_phoff = elf[4];
@@ -113,11 +119,18 @@ static int parse_header_fself(uint64_t header, uint32_t size, struct fself_heade
     ex_offset = ((ex_offset - 1) | 15) + 1;
     uint64_t ex[4];
     if(copy_from_kernel_buffer(ex, header, header_end, ex_offset, sizeof(ex)))
+    {
+        METRIC_INC(fself_header_parse_failures);
         return 0;
+    }
     if(ex[1] != 1) //not fself
+    {
+        METRIC_INC(fself_header_parse_not_fself);
         return 0;
+    }
     info->is_fself = 1;
     info->authinfo_offset = ex_offset + 64 + 48 + n_entries * 80 + 80;
+    METRIC_INC(fself_header_parse_fself);
     return info->is_fself;
 }
 
@@ -126,11 +139,13 @@ static void load_header_fself_authinfo(uint64_t header, uint32_t size, struct fs
     uint64_t header_end = header + size;
     uint64_t signature[18] = {0};
 
+    METRIC_INC(fself_authinfo_loads);
     if(!copy_from_kernel_buffer(signature, header, header_end, info->authinfo_offset, sizeof(signature))
     && signature[0] == 0x88)
     {
         memcpy(info->authinfo, signature+1, 0x88);
         info->have_authinfo = 1;
+        METRIC_INC(fself_authinfo_found);
     }
     info->authinfo_loaded = 1;
 }
@@ -139,11 +154,14 @@ static struct fself_header_info* get_header_fself_info(uint64_t header, uint32_t
 {
     if(!s_header_cache.valid || s_header_cache.header != header || s_header_cache.size != size)
     {
+        METRIC_INC(fself_header_cache_misses);
         s_header_cache.header = header;
         s_header_cache.size = size;
         s_header_cache.valid = 1;
         parse_header_fself(header, size, &s_header_cache.info);
     }
+    else
+        METRIC_INC(fself_header_cache_hits);
     return &s_header_cache.info;
 }
 
@@ -191,9 +209,12 @@ static int get_context_fself_info(uint64_t ctx, uint16_t* e_type, int* is_ps4, u
         return 0;
     if(!same_context_fself_info(ctx, ctx_data))
     {
+        METRIC_INC(fself_context_cache_misses);
         s_header_cache.valid = 0;
         remember_context_fself_info(ctx, ctx_data[7], (uint32_t)ctx_data[1], ctx_data);
     }
+    else
+        METRIC_INC(fself_context_cache_hits);
     return is_header_fself(s_context_cache.header, s_context_cache.size, e_type, is_ps4, authinfo, have_authinfo);
 }
 
@@ -302,16 +323,19 @@ void handle_fself_trap(uint64_t* regs, uint32_t trapno)
 
 int try_handle_fself_mailbox(uint64_t* regs, uint64_t lr)
 {
+    METRIC_TIME_START(start_cycles);
+#define RETURN_FSELF_MAILBOX(value) do { METRIC_TIME(fself_mailbox_cycles_total, fself_mailbox_cycles_max, start_cycles); return (value); } while(0)
     if(lr == (uint64_t)sceSblServiceMailbox_lr_verifyHeader)
     {
+        METRIC_INC(fself_mailbox_verify_header);
         uint64_t self_context = regs[(FWVER >= 0x800) ? RBX : R14];
         uint64_t ctx_data[8];
         uint64_t self_header;
-		uint32_t size;
+			uint32_t size;
         if(copy_from_kernel(&size, regs[RDX]+16, 4))
-            return 0;
+            RETURN_FSELF_MAILBOX(0);
         if(copy_from_kernel(ctx_data, self_context, sizeof(ctx_data)))
-            return 0;
+            RETURN_FSELF_MAILBOX(0);
         self_header = ctx_data[7];
         remember_context_fself_info(self_context, self_header, size, ctx_data);
         if(is_header_fself(self_header, size, 0, 0, 0, 0))
@@ -325,85 +349,91 @@ int try_handle_fself_mailbox(uint64_t* regs, uint64_t lr)
             };
             memcpy(fself_header_backup, trap_frame, 48);
             if(copy_from_kernel(fself_header_backup+48, self_header, mini_syscore_header_size))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
             if(copy_from_kernel(mini_header, (uint64_t)mini_syscore_header, mini_syscore_header_size))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
             if(copy_to_kernel(self_header, mini_header, mini_syscore_header_size))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
             size = mini_syscore_header_size;
             if(copy_to_kernel(regs[RDX]+16, &size, 4))
             {
                 copy_to_kernel(self_header, fself_header_backup+48, mini_syscore_header_size);
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
             }
             if(push_stack_checked(regs, fself_header_backup, sizeof(fself_header_backup)))
             {
                 copy_to_kernel(self_header, fself_header_backup+48, mini_syscore_header_size);
                 copy_to_kernel(regs[RDX]+16, &original_size, 4);
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
             }
+            METRIC_INC(fself_mailbox_verify_header_emulated);
         }
     }
     else if(lr == (uint64_t)sceSblServiceMailbox_lr_loadSelfSegment)
     {
+        METRIC_INC(fself_mailbox_load_self_segment);
         uint64_t ctx;
         if(FWVER >= 0x1000)
         {
             if(kpeek64_checked(regs[RBP] - 232, &ctx))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
         }
         else if(FWVER >= 0x900 && FWVER <= 0x960)
             ctx = regs[R14];
         else if(FWVER >= 0x800 && FWVER <= 0x860)
         {
             if(kpeek64_checked(regs[RBP] - 240, &ctx))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
         }
         else
             ctx = regs[RBX];
         if(get_context_fself_info(ctx, 0, 0, 0, 0))
         {
             if(pop_stack_checked(regs, &regs[RIP], 8))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
             regs[RAX] = 0;
+            METRIC_INC(fself_mailbox_load_self_segment_emulated);
         }
     }
     else if(lr == (uint64_t)sceSblServiceMailbox_lr_decryptSelfBlock)
     {
+        METRIC_INC(fself_mailbox_decrypt_self_block);
         uint64_t ctx;
         if(FWVER >= 0x800)
             ctx = regs[R12];
         else if(FWVER >= 0x500 && FWVER <= 0x761)
         {
             if(kpeek64_checked(regs[RBP] - 192, &ctx))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
         }
         else if(kpeek64_checked(regs[RBP] - sceSblServiceMailbox_decryptSelfBlock_rsp_to_rbp +
                                 sceSblServiceMailbox_decryptSelfBlock_rsp_to_self_context, &ctx))
-            return 0;
+            RETURN_FSELF_MAILBOX(0);
         if(get_context_fself_info(ctx, 0, 0, 0, 0))
         {
             uint64_t request[8];
             if(copy_from_kernel(request, regs[RDX], sizeof(request)))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
             if(pop_stack_checked(regs, &regs[RIP], 8))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
             memcpy(DMEM+request[1], DMEM+request[2], (uint32_t)request[6]);
             regs[RAX] = 0;
+            METRIC_INC(fself_mailbox_decrypt_self_block_emulated);
         }
     }
     else if(lr == (uint64_t)sceSblServiceMailbox_lr_decryptMultipleSelfBlocks)
     {
+        METRIC_INC(fself_mailbox_decrypt_multiple_self_blocks);
         uint64_t ctx;
         if(FWVER >= 0x600)
         {
             if(kpeek64_checked(regs[RBP] - 208, &ctx))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
         }
         else if(FWVER >= 0x500 && FWVER <= 0x550)
         {
             if(kpeek64_checked(regs[RBP] - 216, &ctx))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
         }
         else
             ctx = regs[R13];
@@ -411,25 +441,30 @@ int try_handle_fself_mailbox(uint64_t* regs, uint64_t lr)
         {
             uint64_t request[8];
             if(copy_from_kernel(request, regs[RDX], sizeof(request)))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
             if(pop_stack_checked(regs, &regs[RIP], 8))
-                return 0;
+                RETURN_FSELF_MAILBOX(0);
             uint64_t* src = (uint64_t*)(DMEM + request[1]);
             uint64_t* dst = (uint64_t*)(DMEM + request[2]);
             copy_decrypted_self_blocks(DMEM, src, dst, request[5]);
             regs[RAX] = 0;
+            METRIC_INC(fself_mailbox_decrypt_multiple_self_blocks_emulated);
         }
     }
     else
-        return 0;
+        RETURN_FSELF_MAILBOX(0);
 
-    return 1;
+    RETURN_FSELF_MAILBOX(1);
+#undef RETURN_FSELF_MAILBOX
 }
 
 int try_handle_fself_trap(uint64_t* regs)
 {
+    METRIC_TIME_START(start_cycles);
+#define RETURN_FSELF_TRAP(value) do { METRIC_TIME(fself_trap_cycles_total, fself_trap_cycles_max, start_cycles); return (value); } while(0)
     if(regs[RIP] == (uint64_t)sceSblAuthMgrSmIsLoadable2)
     {
+        METRIC_INC(fself_trap_is_loadable2);
         uint16_t e_type;
         int have_authinfo;
         uint64_t authinfo[17];
@@ -455,48 +490,54 @@ int try_handle_fself_trap(uint64_t* regs)
                     p_authinfo = s_auth_info_for_exec;
             }
             if(copy_from_kernel(&ret_addr, regs[RSP], sizeof(ret_addr)))
-                return 1;
+                RETURN_FSELF_TRAP(1);
             if(copy_to_kernel(regs[R8], p_authinfo, 0x88))
-                return 1;
+                RETURN_FSELF_TRAP(1);
             if(copy_to_kernel(regs[RDI] + 62, &(const uint16_t[1]){0xdeb7}, 2))
-                return 1;
+                RETURN_FSELF_TRAP(1);
             regs[RSP] += 8;
             regs[RIP] = ret_addr;
             regs[RAX] = 0;
+            METRIC_INC(fself_trap_is_loadable2_emulated);
         }
     }
     else if(regs[RIP] == (uint64_t)loadSelfSegment_watchpoint)
     {
+        METRIC_INC(fself_trap_watchpoint);
         uint64_t frame[4];
         if(copy_from_kernel(frame, regs[RSP], sizeof(frame)))
-            return 1;
+            RETURN_FSELF_TRAP(1);
         regs[(FWVER >= 0x800) ? RAX : R10] |= 0xffffull << 48;
         if(frame[3] == (uint64_t)loadSelfSegment_watchpoint_lr)
         {
             if(!set_dbgregs_for_watchpoint(regs, dbgregs_for_loadSelfSegment, sizeof(frame)))
-                return 1;
+                RETURN_FSELF_TRAP(1);
         }
         else if(frame[3] == (uint64_t)decryptSelfBlock_watchpoint_lr)
         {
             if(!set_dbgregs_for_watchpoint(regs, dbgregs_for_decryptSelfBlock, sizeof(frame)))
-                return 1;
+                RETURN_FSELF_TRAP(1);
         }
         else if(frame[3] == (uint64_t)decryptMultipleSelfBlocks_watchpoint_lr)
         {
             if(!set_dbgregs_for_watchpoint(regs, dbgregs_for_decryptMultipleSelfBlocks, sizeof(frame)))
-                return 1;
+                RETURN_FSELF_TRAP(1);
         }
+        METRIC_INC(fself_trap_watchpoint_emulated);
     }
     else if(regs[RIP] == (uint64_t)loadSelfSegment_epilogue
          || regs[RIP] == (uint64_t)decryptSelfBlock_epilogue
          || regs[RIP] == (uint64_t)decryptMultipleSelfBlocks_epilogue)
     {
+         METRIC_INC(fself_trap_epilogue);
          if(!unset_dbgregs_for_watchpoint(regs))
-             return 1;
+             RETURN_FSELF_TRAP(1);
+         METRIC_INC(fself_trap_epilogue_emulated);
     }
     else
-        return 0;
-    return 1;
+        RETURN_FSELF_TRAP(0);
+    RETURN_FSELF_TRAP(1);
+#undef RETURN_FSELF_TRAP
 }
 
 #endif

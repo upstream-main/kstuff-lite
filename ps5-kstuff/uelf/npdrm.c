@@ -1,6 +1,7 @@
 // https://github.com/PS5Dev/Byepervisor/blob/57204cbd7bd26ed4623634d52b0f60f40d630087/hen/src/fpkg.cpp#L82
 
 #include <string.h>
+#include <sys/sysproto.h>
 #include "utils.h"
 #include "npdrm.h"
 #include "log.h"
@@ -21,6 +22,14 @@ extern char sceSblServiceMailbox[];
 static const uint8_t rif_debug_key[] = {0x96, 0xC2, 0x26, 0x8D, 0x69, 0x26, 0x1C, 0x8B, 0x1E, 0x3B, 0x6B, 0xFF, 0x2F, 0xE0, 0x4E, 0x12};
 
 enum { AES128_EXPKEY_SIZE = 16 * 11 };
+
+#if KSTUFF_OBS
+static struct
+{
+    uint64_t com;
+    int valid;
+} s_current_ioctl_com;
+#endif
 
 static struct
 {
@@ -77,6 +86,8 @@ int memcmp(const void *s1, const void *s2, size_t n)
 
 int try_handle_npdrm_mailbox(uint64_t *regs, uint64_t lr)
 {
+    METRIC_TIME_START(start_cycles);
+#define RETURN_NPDRM(value) do { METRIC_TIME(npdrm_mailbox_cycles_total, npdrm_mailbox_cycles_max, start_cycles); return (value); } while(0)
     struct {
         uint32_t cmd;
         uint32_t _pad;
@@ -86,23 +97,27 @@ int try_handle_npdrm_mailbox(uint64_t *regs, uint64_t lr)
     if (lr != (uint64_t)sceSblServiceMailbox_lr_npdrm_cmd_5 &&
         lr != (uint64_t)sceSblServiceMailbox_lr_npdrm_cmd_6)
     {
-        return 0;
+        METRIC_INC(npdrm_reject_bad_lr);
+        RETURN_NPDRM(0);
     }
     if (copy_from_kernel(&request_hdr, regs[RDX], sizeof(request_hdr)))
     {
-        return 1;
+        METRIC_INC(npdrm_reject_copy_in_fail);
+        RETURN_NPDRM(1);
     }
 #else
     if (copy_from_kernel(&request_hdr, regs[RDX], sizeof(request_hdr)))
     {
-        return 0;
+        METRIC_INC(npdrm_reject_copy_in_fail);
+        RETURN_NPDRM(0);
     }
     // Other functions may use this same cmd number for different purposes (depending on RDI/handle i believe, however its value changes between fws)
     // for example, sceSblServiceMailbox_lr_decryptSelfBlock also sees cmd 6
     // if we only relied on this, it would work safely because of the later checks, its just wasteful
     if (request_hdr.cmd != 5 && request_hdr.cmd != 6)
     {
-        return 0;
+        METRIC_INC(npdrm_reject_bad_cmd);
+        RETURN_NPDRM(0);
     }
 #endif
     METRIC_INC(npdrm_mailbox_total);
@@ -118,40 +133,44 @@ int try_handle_npdrm_mailbox(uint64_t *regs, uint64_t lr)
 
     if (layout.rif.type != 0x2)
     {
+        METRIC_INC(npdrm_reject_bad_rif_type);
 #ifdef NPDRM_PORTING
-        return 0;
+        RETURN_NPDRM(0);
 #else
-        return 1;
+        RETURN_NPDRM(1);
 #endif
     }
 
     if (uelf_fpu_enter())
     {
+        METRIC_INC(npdrm_reject_fpu_fail);
 #ifdef NPDRM_PORTING
-        return 0;
+        RETURN_NPDRM(0);
 #else
-        return 1;
+        RETURN_NPDRM(1);
 #endif
     }
     uint8_t contentid_hash[32];
     if (sha256_buffer_fpu_held(layout.rif.contentId, sizeof(layout.rif.contentId), contentid_hash))
     {
         uelf_fpu_exit();
+        METRIC_INC(npdrm_reject_bad_hash);
 #ifdef NPDRM_PORTING
-        return 0;
+        RETURN_NPDRM(0);
 #else
-        return 1;
+        RETURN_NPDRM(1);
 #endif
     }
 
     if (memcmp(contentid_hash, layout.rif.rifIv, 16) != 0)
     {
         uelf_fpu_exit();
+        METRIC_INC(npdrm_reject_bad_hash);
 #ifdef NPDRM_PORTING
-        return 0;
+        RETURN_NPDRM(0);
 #else
         // not a debug rif
-        return 1;
+        RETURN_NPDRM(1);
 #endif
     }
     METRIC_INC(npdrm_debug_rif_matches);
@@ -199,39 +218,49 @@ int try_handle_npdrm_mailbox(uint64_t *regs, uint64_t lr)
                                                        sizeof(layout.rif.rifSecret), layout.rif.rifIv))
             {
                 uelf_fpu_exit();
-                return 1;
+                METRIC_INC(npdrm_reject_bad_secret);
+                RETURN_NPDRM(1);
             }
 
         if (memcmp(contentid_hash + 16, decrypted_secret, 16) != 0)
         {
             uelf_fpu_exit();
             // does not use debug rif key/failed to decrypt?
-            return 1;
+            METRIC_INC(npdrm_reject_bad_secret);
+            RETURN_NPDRM(1);
         }
 
         // copy both unk10 and unk20
         if(copy_to_kernel(regs[RDX] + __builtin_offsetof(struct NpDrmCmd6, unk10), &decrypted_secret[0x70], 0x20))
         {
             uelf_fpu_exit();
-            return 1;
+            METRIC_INC(npdrm_reject_copy_out_fail);
+            RETURN_NPDRM(1);
         }
     }
 
     memcpy(DMEM + rif_pa + __builtin_offsetof(struct RifCmd56MemoryLayout, output), &layout.output, sizeof(layout.output));
     METRIC_INC(npdrm_mailbox_emulated);
+#if KSTUFF_OBS
+    if(s_current_ioctl_com.valid)
+        observe_ioctl_com_emulated(s_current_ioctl_com.com, request_hdr.cmd);
+#endif
+    observe_current_syscall_emulated();
 
     uint32_t res = 0;
     if(copy_to_kernel(regs[RDX] + 0x4, &res, sizeof(res)))
     {
         uelf_fpu_exit();
-        return 1;
+        METRIC_INC(npdrm_reject_copy_out_fail);
+        RETURN_NPDRM(1);
     }
 
     uelf_fpu_exit();
     regs[RIP] = lr;
     regs[RAX] = 0;
     regs[RSP] += 8;
-    return 1;
+    RETURN_NPDRM(1);
+#undef RETURN_NPDRM
 }
 
 static const uint64_t dbgregs_for_ioctl[6] = {
@@ -240,5 +269,16 @@ static const uint64_t dbgregs_for_ioctl[6] = {
 
 void handle_ioctl_syscall(uint64_t *regs)
 {
+#if KSTUFF_OBS
+    struct ioctl_args uap;
+    if(copy_from_kernel(&uap, regs[RSI], sizeof(uap)))
+        s_current_ioctl_com.valid = 0;
+    else
+    {
+        s_current_ioctl_com.com = (uint64_t)uap.com;
+        s_current_ioctl_com.valid = 1;
+        observe_ioctl_com_total(s_current_ioctl_com.com);
+    }
+#endif
     start_syscall_with_dbgregs(regs, dbgregs_for_ioctl);
 }

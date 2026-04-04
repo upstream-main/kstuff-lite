@@ -27,6 +27,27 @@ void handle_syscall(uint64_t* regs, int allow_kekcall);
 int rdmsr(uint32_t which, uint64_t* ans);
 int wrmsr(uint32_t which, uint64_t value);
 
+static inline uint64_t uelf_rdtsc(void)
+{
+    uint32_t eax, edx;
+    asm volatile("rdtsc":"=a"(eax),"=d"(edx)::"memory");
+    return (uint64_t)edx << 32 | eax;
+}
+
+#if KSTUFF_OBS
+#define METRIC_TIME_START(var) uint64_t var = uelf_rdtsc()
+#define METRIC_TIME(total_field, max_field, start_cycles) do { \
+    uint64_t _metric_elapsed = uelf_rdtsc() - (uint64_t)(start_cycles); \
+    METRIC_ADD(total_field, _metric_elapsed); \
+    METRIC_MAX(max_field, _metric_elapsed); \
+} while(0)
+#else
+#define METRIC_TIME_START(var) uint64_t var __attribute__((unused)) = 0
+#define METRIC_TIME(total_field, max_field, start_cycles) do { \
+    (void)(start_cycles); \
+} while(0)
+#endif
+
 static inline int kpeek64_checked(uintptr_t kptr, uint64_t* value)
 {
     return copy_from_kernel(value, kptr, sizeof(*value));

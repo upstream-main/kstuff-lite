@@ -87,7 +87,11 @@ static struct crypto_message_info inspect_crypto_message(const uint64_t msg_data
     if(is_xts_message(msg_data))
     {
         int key_idx = HANDLE_TO_IDX(msg_data[5]);
-        if(key_idx >= 0 && has_fake_key(key_idx))
+        if(key_idx < 0 || !has_fake_key(key_idx))
+        {
+            METRIC_INC(fpkg_reject_xts_non_fake);
+        }
+        else
         {
             struct crypto_message_info info = {
                 .kind = CRYPTO_MESSAGE_XTS,
@@ -99,7 +103,15 @@ static struct crypto_message_info inspect_crypto_message(const uint64_t msg_data
     if(is_hmac_message(msg_data))
     {
         int key_idx = HANDLE_TO_IDX(msg_data[20]);
-        if(key_idx >= 0 && msg_data[3] == msg_data[1] * 8 && has_fake_key(key_idx))
+        if(msg_data[3] != msg_data[1] * 8)
+        {
+            METRIC_INC(fpkg_reject_hmac_bad_shape);
+        }
+        else if(key_idx < 0 || !has_fake_key(key_idx))
+        {
+            METRIC_INC(fpkg_reject_hmac_non_fake);
+        }
+        else
         {
             struct crypto_message_info info = {
                 .kind = CRYPTO_MESSAGE_HMAC,
@@ -108,6 +120,7 @@ static struct crypto_message_info inspect_crypto_message(const uint64_t msg_data
             return info;
         }
     }
+    METRIC_INC(fpkg_reject_other_message);
     return (struct crypto_message_info){
         .kind = CRYPTO_MESSAGE_OTHER,
         .key_idx = -1,
@@ -223,6 +236,7 @@ static inline uint64_t rdtsc(void)
 
 static int handle_crypto_request(uint64_t* regs, uint64_t bytes_handled)
 {
+    METRIC_TIME_START(start_cycles);
     // uint64_t start_time = rdtsc();
     int total = 0;
     int emulated = 0;
@@ -254,7 +268,10 @@ static int handle_crypto_request(uint64_t* regs, uint64_t bytes_handled)
         if(!fpu_entered && msg_info.kind != CRYPTO_MESSAGE_OTHER)
         {
             if(uelf_fpu_enter())
+            {
+                METRIC_INC(fpkg_request_fpu_enter_fail);
                 break;
+            }
             fpu_entered = 1;
         }
 
@@ -302,6 +319,7 @@ static int handle_crypto_request(uint64_t* regs, uint64_t bytes_handled)
         {
             // not all requests successfully emulated
             // we can't run only part of the request, so just report failure
+            METRIC_INC(fpkg_request_partial_emulation);
             total_status = -1;
         }
 
@@ -318,9 +336,13 @@ static int handle_crypto_request(uint64_t* regs, uint64_t bytes_handled)
 
 exit:
     if(!handled)
+    {
         METRIC_INC(crypto_requests_fallback);
+        METRIC_INC(fpkg_request_no_emulation);
+    }
     if(fpu_entered)
         uelf_fpu_exit();
+    METRIC_TIME(fpkg_crypto_request_cycles_total, fpkg_crypto_request_cycles_max, start_cycles);
     return handled;
 }
 
@@ -328,7 +350,9 @@ int try_handle_fpkg_trap(uint64_t* regs)
 {
     if(regs[RIP] == (uint64_t)sceSblServiceCryptAsync_deref_singleton)
     {
-        if(!handle_crypto_request(regs, 0))
+        if(handle_crypto_request(regs, 0))
+            observe_current_syscall_emulated();
+        else
         {
             regs[RAX] |= -1ull << 48;
             regs[RBX] |= -1ull << 48;
@@ -373,6 +397,7 @@ int try_handle_fpkg_mailbox(uint64_t* regs, uint64_t lr)
                     regs[RAX] = 0;
                     regs[RSP] += 8;
                     METRIC_INC(verify_superblock_emulated);
+                    observe_current_syscall_emulated();
                 }
                 else
                     unregister_fake_key(key1);
@@ -398,6 +423,7 @@ int try_handle_fpkg_mailbox(uint64_t* regs, uint64_t lr)
             regs[RAX] = 0;
             regs[RSP] += 8;
             METRIC_INC(clear_key_emulated);
+            observe_current_syscall_emulated();
         }
     }
     /*else

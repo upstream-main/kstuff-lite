@@ -7,6 +7,7 @@
 
 int virt2phys(uint64_t addr, uint64_t* phys, uint64_t* phys_limit)
 {
+    METRIC_TIME_START(start_cycles);
     METRIC_INC(virt2phys_calls);
     uint64_t pml = cr3_phys;
     for(int i = 39; i >= 12; i -= 9)
@@ -15,6 +16,7 @@ int virt2phys(uint64_t addr, uint64_t* phys, uint64_t* phys_limit)
         {
             METRIC_INC(virt2phys_failures);
             log_word(0xdead0000dead0000);
+            METRIC_TIME(virt2phys_cycles_total, virt2phys_cycles_max, start_cycles);
             return 0;
         }
         uint64_t next_pml = *(uint64_t*)(DMEM + pml + ((addr & (0x1ffull << i)) >> (i - 3)));
@@ -23,6 +25,7 @@ int virt2phys(uint64_t addr, uint64_t* phys, uint64_t* phys_limit)
             METRIC_INC(virt2phys_failures);
             log_word(0xdeaddeaddeaddead);
             log_word((uint64_t)__builtin_return_address(0));
+            METRIC_TIME(virt2phys_cycles_total, virt2phys_cycles_max, start_cycles);
             return 0;
         }
         if((next_pml & 128) || i == 12)
@@ -31,14 +34,18 @@ int virt2phys(uint64_t addr, uint64_t* phys, uint64_t* phys_limit)
             addr1 |= addr & ((1ull << i) - 1);
             *phys = addr1;
             *phys_limit = (addr1 | ((1ull << i) - 1)) + 1;
+            METRIC_TIME(virt2phys_cycles_total, virt2phys_cycles_max, start_cycles);
             return 1;
         }
         pml = next_pml & ((1ull << 52) - (1ull << 12));
     }
+    METRIC_TIME(virt2phys_cycles_total, virt2phys_cycles_max, start_cycles);
+    return 0;
 }
 
 int copy_from_kernel(void* dst, uint64_t src, uint64_t sz)
 {
+    METRIC_TIME_START(start_cycles);
     char* p_dst = dst;
     uint64_t phys, phys_end;
     uint64_t total = sz;
@@ -50,6 +57,7 @@ int copy_from_kernel(void* dst, uint64_t src, uint64_t sz)
         {
             METRIC_INC(copy_from_failures);
             log_word((uint64_t)__builtin_return_address(0));
+            METRIC_TIME(copy_from_cycles_total, copy_from_cycles_max, start_cycles);
             return EFAULT;
         }
         size_t chk = phys_end - phys;
@@ -60,11 +68,13 @@ int copy_from_kernel(void* dst, uint64_t src, uint64_t sz)
         src += chk;
         sz -= chk;
     }
+    METRIC_TIME(copy_from_cycles_total, copy_from_cycles_max, start_cycles);
     return 0;
 }
 
 int copy_to_kernel(uint64_t dst, const void* src, uint64_t sz)
 {
+    METRIC_TIME_START(start_cycles);
     const char* p_src = src;
     uint64_t phys, phys_end;
     uint64_t total = sz;
@@ -76,6 +86,7 @@ int copy_to_kernel(uint64_t dst, const void* src, uint64_t sz)
         {
             METRIC_INC(copy_to_failures);
             log_word((uint64_t)__builtin_return_address(0));
+            METRIC_TIME(copy_to_cycles_total, copy_to_cycles_max, start_cycles);
             return EFAULT;
         }
         size_t chk = phys_end - phys;
@@ -86,6 +97,7 @@ int copy_to_kernel(uint64_t dst, const void* src, uint64_t sz)
         p_src += chk;
         sz -= chk;
     }
+    METRIC_TIME(copy_to_cycles_total, copy_to_cycles_max, start_cycles);
     return 0;
 }
 
@@ -238,5 +250,6 @@ void handle_utils_trap(uint64_t* regs, uint32_t trapno)
             return;
         regs[RSP] += sizeof(stack_frame);
         regs[RIP] = stack_frame[11];
+        observe_current_syscall_finish();
     }
 }

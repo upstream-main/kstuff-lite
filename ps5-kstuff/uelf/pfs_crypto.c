@@ -38,10 +38,12 @@ static int virt2phys_local(struct virt2phys_local_cache* cache, uint64_t addr, u
 {
     if(addr >= cache->virt_base && addr < cache->virt_limit)
     {
+        METRIC_INC(virt2phys_local_hits);
         *phys = cache->phys_base + (addr - cache->virt_base);
         *phys_limit = cache->phys_base + (cache->virt_limit - cache->virt_base);
         return 1;
     }
+    METRIC_INC(virt2phys_local_misses);
     if(!virt2phys(addr, phys, phys_limit))
         return 0;
     cache->virt_base = addr;
@@ -288,6 +290,7 @@ static int get_xts_key_cache_entry(struct crypto_request_cache* cache, int key_i
 int pfs_xts_virtual_fpu_held(struct crypto_request_cache* cache, uint64_t dst, uint64_t src, int key_id,
                              const uint8_t* key, uint64_t start, uint32_t count, int is_encrypt)
 {
+    METRIC_TIME_START(start_cycles);
     enum { SECTOR_SIZE = 4096 };
     uint8_t sector[SECTOR_SIZE];
     const struct xts_key_cache_entry* xts_keys;
@@ -296,7 +299,10 @@ int pfs_xts_virtual_fpu_held(struct crypto_request_cache* cache, uint64_t dst, u
     METRIC_INC(xts_requests);
     METRIC_ADD(xts_sectors, count);
     if(get_xts_key_cache_entry(cache, key_id, key, &xts_keys))
+    {
+        METRIC_TIME(xts_cycles_total, xts_cycles_max, start_cycles);
         return -1;
+    }
     while(count)
     {
         uint64_t src_phys, src_end, dst_phys, dst_end;
@@ -322,7 +328,10 @@ int pfs_xts_virtual_fpu_held(struct crypto_request_cache* cache, uint64_t dst, u
                     : isal_aes_xts_dec_128_expanded_key(xts_keys->tweak_key_enc, xts_keys->data_key_dec, (void*)tweak,
                                                         SECTOR_SIZE, DMEM + src_phys, DMEM + dst_phys);
                 if(err)
+                {
+                    METRIC_TIME(xts_cycles_total, xts_cycles_max, start_cycles);
                     return -1;
+                }
                 dst_phys += SECTOR_SIZE;
                 src_phys += SECTOR_SIZE;
                 dst += SECTOR_SIZE;
@@ -336,23 +345,36 @@ int pfs_xts_virtual_fpu_held(struct crypto_request_cache* cache, uint64_t dst, u
         uint64_t tweak[2] = {start, 0};
         METRIC_INC(xts_full_fallback_sectors);
         if(copy_from_kernel(sector, src, SECTOR_SIZE))
+        {
+            METRIC_TIME(xts_cycles_total, xts_cycles_max, start_cycles);
             return -1;
+        }
         if(is_encrypt) {
             if(isal_aes_xts_enc_128_expanded_key(xts_keys->tweak_key_enc, xts_keys->data_key_enc, (void*)tweak,
                                                  SECTOR_SIZE, sector, sector))
+            {
+                METRIC_TIME(xts_cycles_total, xts_cycles_max, start_cycles);
                 return -1;
+            }
         } else {
             if(isal_aes_xts_dec_128_expanded_key(xts_keys->tweak_key_enc, xts_keys->data_key_dec, (void*)tweak,
                                                  SECTOR_SIZE, sector, sector))
+            {
+                METRIC_TIME(xts_cycles_total, xts_cycles_max, start_cycles);
                 return -1;
+            }
         }
         if(copy_to_kernel(dst, sector, SECTOR_SIZE))
+        {
+            METRIC_TIME(xts_cycles_total, xts_cycles_max, start_cycles);
             return -1;
+        }
         dst += SECTOR_SIZE;
         src += SECTOR_SIZE;
         start++;
         count--;
     }
+    METRIC_TIME(xts_cycles_total, xts_cycles_max, start_cycles);
     return 0;
 }
 

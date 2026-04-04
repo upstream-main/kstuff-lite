@@ -13,6 +13,7 @@
 #include "../prosper0gdb/offsets.h"
 #include "../gdb_stub/dbg.h"
 #include "uelf/structs.h"
+#include "uelf/shared_area.h"
 
 void* dlsym(void*, const char*);
 
@@ -797,11 +798,11 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
     for(size_t i = 0; i < 256; i++)
         copyin(comparison_table+256*i, comparison_table_data+256*i, 256);
     uint64_t shared_area;
-    if(comparison_table - comparison_table_base > 4096)
-        shared_area = comparison_table - 4096;
+    if(comparison_table - comparison_table_base > SHARED_AREA_SIZE)
+        shared_area = comparison_table - SHARED_AREA_SIZE;
     else
         shared_area = comparison_table + 65536;
-    kmemzero((void*)shared_area, 4096);
+    kmemzero((void*)shared_area, SHARED_AREA_SIZE);
     uint64_t kernel_dmap = get_dmap_base();
     uint64_t kernel_cr3 = r0gdb_read_cr3();
     uint64_t uelf_virt_base = (find_empty_pml4_index(0) << 39) | (-1ull << 48);
@@ -936,7 +937,7 @@ int main(void* ds, int a, int b, uintptr_t c, uintptr_t d)
 
     copyin(IDT+16*9+5, "\x8e", 1);
     copyin(IDT+16*179+5, "\x8e", 1);
-	
+
     if (shellcore_patches)
     {
         if (patch_shellcore(shellcore_patches,

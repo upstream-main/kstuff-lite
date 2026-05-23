@@ -1,4 +1,4 @@
-# kstuff-lite-dr: What's New
+# kstuff-lite: What's New
 
 - `fpkg` handling and related crypto paths were improved.
   A lot of internal logic was sped up: fewer repeated calculations, fewer repeated memory reads, and faster handling of adjacent data blocks.

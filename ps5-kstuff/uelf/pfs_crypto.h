@@ -8,6 +8,12 @@ enum {
     PFS_CRYPTO_KEY_SIZE = 32,
     PFS_HMAC_SHA256_CACHE_SLOTS = 2,
     PFS_XTS_KEY_CACHE_SLOTS = 2,
+    /*
+     * Number of 4 KiB plaintext blocks cached on the XTS decrypt path.
+     * Each slot costs ~4 KiB of uelf BSS. Raise for better read locality,
+     * lower to shrink the resident footprint. Must be >= 1.
+     */
+    PFS_PLAINTEXT_CACHE_SLOTS = 32,
 };
 
 struct xts_key_cache_entry

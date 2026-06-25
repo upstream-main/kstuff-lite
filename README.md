@@ -32,6 +32,9 @@ What this improves:
 
 ### 2. `fpkg` and PFS crypto handling
 
+- A plaintext block cache was added for the `XTS` decrypt path.
+  A read-only PFS image always decrypts a given sector to the same plaintext, so repeated reads of the same 4 KiB block (executables, file metadata, re-read assets) now skip software `AES-XTS` entirely instead of re-decrypting every time.
+  Entries are keyed on `(key id + key bytes + sector index)`, the encrypt path is never cached, and safety mirrors the existing `XTS`/`HMAC` key caches.
 - Caches were added for crypto state.
 - Expanded `XTS` keys and `HMAC-SHA256` state are now cached.
 - Virtual-to-physical translation was sped up in crypto paths.

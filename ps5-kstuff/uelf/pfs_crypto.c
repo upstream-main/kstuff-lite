@@ -260,6 +260,83 @@ static int get_xts_key_cache_entry(struct crypto_request_cache* cache, int key_i
     return 0;
 }
 
+/*
+ * Plaintext block cache for the XTS decrypt path.
+ *
+ * A read-only PFS image always returns the same ciphertext for a given
+ * (key, sector), so the decrypted plaintext is a pure function of
+ * (key, sector). Caching it lets repeated reads of the same 4 KiB block
+ * (executables, file metadata, re-read assets) skip the software
+ * AES-XTS entirely -- previously every re-read re-decrypted the sector.
+ *
+ * Correctness notes:
+ *  - Decryption only; the encrypt path is never cached.
+ *  - An entry is keyed on (key_id + full key bytes + sector index), so a
+ *    recycled fake-key slot can never be served stale data.
+ *  - Safety mirrors the hmac/xts key caches: the entry is invalidated
+ *    (valid = 0) before any field is written and only re-armed after the
+ *    plaintext copy finishes. A torn update degrades into a miss (a
+ *    redundant decrypt), never corrupt data.
+ *  - The backing storage is zero-initialised by load_kelf's PT_LOAD
+ *    handler (kmemzero of p_memsz - p_filesz), so every slot starts with
+ *    valid = 0.
+ */
+struct plaintext_cache_entry
+{
+    int key_id;
+    uint64_t sector;
+    uint64_t lru;
+    uint8_t valid;
+    uint8_t key[PFS_CRYPTO_KEY_SIZE];
+    uint8_t plaintext[4096];
+};
+
+static struct
+{
+    struct plaintext_cache_entry entries[PFS_PLAINTEXT_CACHE_SLOTS];
+    uint64_t clock;
+} s_plaintext_cache;
+
+static struct plaintext_cache_entry* plaintext_cache_find(int key_id, const uint8_t* key, uint64_t sector)
+{
+    for(size_t i = 0; i < PFS_PLAINTEXT_CACHE_SLOTS; i++)
+    {
+        struct plaintext_cache_entry* e = &s_plaintext_cache.entries[i];
+        if(e->valid && e->key_id == key_id && e->sector == sector
+           && !memcmp(e->key, key, PFS_CRYPTO_KEY_SIZE))
+        {
+            e->lru = ++s_plaintext_cache.clock;
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static struct plaintext_cache_entry* plaintext_cache_victim(void)
+{
+    struct plaintext_cache_entry* victim = &s_plaintext_cache.entries[0];
+    for(size_t i = 1; i < PFS_PLAINTEXT_CACHE_SLOTS; i++)
+    {
+        if(s_plaintext_cache.entries[i].lru < victim->lru)
+            victim = &s_plaintext_cache.entries[i];
+    }
+    return victim;
+}
+
+static void plaintext_cache_store(int key_id, const uint8_t* key, uint64_t sector, const void* plaintext)
+{
+    struct plaintext_cache_entry* e = plaintext_cache_find(key_id, key, sector);
+    if(!e)
+        e = plaintext_cache_victim();
+    e->valid = 0;
+    e->key_id = key_id;
+    e->sector = sector;
+    memcpy(e->key, key, PFS_CRYPTO_KEY_SIZE);
+    memcpy(e->plaintext, plaintext, sizeof(e->plaintext));
+    e->lru = ++s_plaintext_cache.clock;
+    e->valid = 1;
+}
+
 int pfs_xts_virtual_fpu_held(struct crypto_request_cache* cache, uint64_t dst, uint64_t src, int key_id,
                              const uint8_t* key, uint64_t start, uint32_t count, int is_encrypt)
 {
@@ -292,12 +369,32 @@ int pfs_xts_virtual_fpu_held(struct crypto_request_cache* cache, uint64_t dst, u
             METRIC_ADD(xts_full_direct_sectors, run);
             while(run--)
             {
-                uint64_t tweak[2] = {start, 0};
-                int err = is_encrypt
-                    ? isal_aes_xts_enc_128_expanded_key(xts_keys->tweak_key_enc, xts_keys->data_key_enc, (void*)tweak,
-                                                        SECTOR_SIZE, DMEM + src_phys, DMEM + dst_phys)
-                    : isal_aes_xts_dec_128_expanded_key(xts_keys->tweak_key_enc, xts_keys->data_key_dec, (void*)tweak,
-                                                        SECTOR_SIZE, DMEM + src_phys, DMEM + dst_phys);
+                uint64_t sector_index = start;
+                struct plaintext_cache_entry* pt_hit = NULL;
+                uint64_t tweak[2] = {sector_index, 0};
+                int err;
+
+                if(!is_encrypt)
+                    pt_hit = plaintext_cache_find(key_id, key, sector_index);
+
+                if(pt_hit)
+                {
+                    memcpy(DMEM + dst_phys, pt_hit->plaintext, SECTOR_SIZE);
+                    METRIC_INC(plaintext_cache_hits);
+                    err = 0;
+                }
+                else
+                {
+                    if(!is_encrypt)
+                        METRIC_INC(plaintext_cache_misses);
+                    err = is_encrypt
+                        ? isal_aes_xts_enc_128_expanded_key(xts_keys->tweak_key_enc, xts_keys->data_key_enc, (void*)tweak,
+                                                            SECTOR_SIZE, DMEM + src_phys, DMEM + dst_phys)
+                        : isal_aes_xts_dec_128_expanded_key(xts_keys->tweak_key_enc, xts_keys->data_key_dec, (void*)tweak,
+                                                            SECTOR_SIZE, DMEM + src_phys, DMEM + dst_phys);
+                    if(!err && !is_encrypt)
+                        plaintext_cache_store(key_id, key, sector_index, DMEM + dst_phys);
+                }
                 if(err)
                 {
                     METRIC_TIME(xts_cycles_total, xts_cycles_max, start_cycles);
@@ -313,27 +410,43 @@ int pfs_xts_virtual_fpu_held(struct crypto_request_cache* cache, uint64_t dst, u
             continue;
         }
 
-        uint64_t tweak[2] = {start, 0};
-        METRIC_INC(xts_full_fallback_sectors);
-        if(copy_from_kernel(sector, src, SECTOR_SIZE))
+        uint64_t sector_index = start;
+        int from_cache = 0;
+        if(!is_encrypt)
         {
-            METRIC_TIME(xts_cycles_total, xts_cycles_max, start_cycles);
-            return -1;
+            struct plaintext_cache_entry* pt_hit = plaintext_cache_find(key_id, key, sector_index);
+            if(pt_hit)
+            {
+                memcpy(sector, pt_hit->plaintext, SECTOR_SIZE);
+                METRIC_INC(plaintext_cache_hits);
+                from_cache = 1;
+            }
+            else
+            {
+                METRIC_INC(plaintext_cache_misses);
+            }
         }
-        if(is_encrypt) {
-            if(isal_aes_xts_enc_128_expanded_key(xts_keys->tweak_key_enc, xts_keys->data_key_enc, (void*)tweak,
-                                                 SECTOR_SIZE, sector, sector))
+        if(!from_cache)
+        {
+            uint64_t tweak[2] = {sector_index, 0};
+            METRIC_INC(xts_full_fallback_sectors);
+            if(copy_from_kernel(sector, src, SECTOR_SIZE))
             {
                 METRIC_TIME(xts_cycles_total, xts_cycles_max, start_cycles);
                 return -1;
             }
-        } else {
-            if(isal_aes_xts_dec_128_expanded_key(xts_keys->tweak_key_enc, xts_keys->data_key_dec, (void*)tweak,
-                                                 SECTOR_SIZE, sector, sector))
+            int err = is_encrypt
+                ? isal_aes_xts_enc_128_expanded_key(xts_keys->tweak_key_enc, xts_keys->data_key_enc, (void*)tweak,
+                                                   SECTOR_SIZE, sector, sector)
+                : isal_aes_xts_dec_128_expanded_key(xts_keys->tweak_key_enc, xts_keys->data_key_dec, (void*)tweak,
+                                                   SECTOR_SIZE, sector, sector);
+            if(err)
             {
                 METRIC_TIME(xts_cycles_total, xts_cycles_max, start_cycles);
                 return -1;
             }
+            if(!is_encrypt)
+                plaintext_cache_store(key_id, key, sector_index, sector);
         }
         if(copy_to_kernel(dst, sector, SECTOR_SIZE))
         {

@@ -268,6 +268,8 @@ static void print_metrics(const struct kstuff_metrics* metrics)
     PRINT_FIELD("hmac_miss", metrics->hmac_cache_misses);
     PRINT_FIELD("xts_hit", metrics->xts_cache_hits);
     PRINT_FIELD("xts_miss", metrics->xts_cache_misses);
+    PRINT_FIELD("pt_hit", metrics->plaintext_cache_hits);
+    PRINT_FIELD("pt_miss", metrics->plaintext_cache_misses);
     PRINT_FIELD("hmac_req", metrics->hmac_requests);
     PRINT_FIELD("hmac_bytes", metrics->hmac_bytes);
     PRINT_FIELD("fpu", metrics->fpu_enters);

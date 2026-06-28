@@ -38,7 +38,7 @@ along with this program; see the file COPYING. If not, see
 #include <machine/param.h>
 #include <ps5/payload.h>
 #include <ps5/klog.h>
-#include "payload_bin.c"
+#include <ps5/kernel.h>
 
 #include "image.h"
 #include "ufs_mount.h"
@@ -48,6 +48,13 @@ along with this program; see the file COPYING. If not, see
 #include "mount_helpers.h"
 #include "shellui_patch.h"
 #include "utils.h"
+
+asm(".section .rodata\n"
+    ".global ___ps5_kstuff_payload_bin\n"
+    "___ps5_kstuff_payload_bin:\n"
+    ".incbin \"../../ps5-kstuff/payload.bin\"\n");
+
+extern char ___ps5_kstuff_payload_bin[];
 
 int patch_app_db(void);
 int sceKernelSetProcessName(const char *name);
@@ -354,6 +361,14 @@ int main(void) {
 
     void (*entry)(payload_args_t*) = base + ehdr->e_entry;
     payload_args_t* args = payload_get_args();
+
+    // allow dlsym on 5.00+ - https://gist.github.com/TheOfficialFloW/7174351201b5260d7780780f4059bebf#file-exploitnetcontrolimpl-java-L851
+    uint64_t proc = kernel_get_proc(-1);
+    uint64_t p_dynlib = kernel_getlong(proc + 0x3e8);
+    uint64_t dynlib_eboot = kernel_getlong(p_dynlib + 0x00);
+    uint64_t eboot_segments = kernel_getlong(dynlib_eboot + 0x40);
+    kernel_setlong(eboot_segments + 0x08, 0); // addr
+    kernel_setlong(eboot_segments + 0x10, 0xFFFFFFFFFFFFFFFFL); // size
 
     entry(args);
     if(*args->payloadout == 0) {

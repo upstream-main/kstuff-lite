@@ -1,5 +1,3 @@
-LOADER_OPT ?= -O2
-
 #   Copyright (C) 2025 John Törnblom
 #
 # This file is free software; you can redistribute it and/or modify it
@@ -25,6 +23,7 @@ else
     $(error PS5_PAYLOAD_SDK is undefined)
 endif
 
+LOADER_OPT ?= -O2
 CFLAGS += -Wall -Werror
 CPPFLAGS += -Iinclude
 
@@ -33,25 +32,24 @@ LDFLAGS += -lz \
            -lSceUserService \
            -lSceAppInstUtil \
            -lSceFsInternalForVsh \
-           -lsqlite3
+           -lsqlite3 \
+		   -Wl,-s
 
 # Automatically grab all .c files in src/
-SRC := $(filter-out src/payload_bin.c,$(shell find src -name '*.c'))
+SRC := $(shell find src -name '*.c')
 
 all: kstuff.elf
 
-../ps5-kstuff/payload.bin:
+.FORCE:
+
+../ps5-kstuff/payload.bin: .FORCE
 	$(MAKE) -C ../ps5-kstuff/
 
-src/payload_bin.c: ../ps5-kstuff/payload.bin
-	xxd -i $< > $@
-
-kstuff.elf: src/payload_bin.c $(SRC)
+kstuff.elf: ../ps5-kstuff/payload.bin $(SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LOADER_OPT) $(SRC) -o $@ $(LDFLAGS)
-	strip $@
 
 clean:
-	rm -f src/payload_bin.c *.o *.elf
+	rm -f *.o *.elf
 
 test: kstuff.elf
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
